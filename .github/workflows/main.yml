@@ -1,0 +1,33 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip \
+            autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo5 cmake libffi-dev libssl-dev build-essential ccache
+      - name: Install buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install "cython<3.0" buildozer
+      - name: Build APK
+        run: |
+          export PATH=$PATH:$HOME/.local/bin
+          yes | buildozer android debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: knitting-apk
+          path: bin/*.apk
+          if-no-files-found: error
