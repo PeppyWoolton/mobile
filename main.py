@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Мобильное приложение (Android, Kivy) — «Вязальное производство».
+"""Мобильное приложение «Вязальное производство» (Android, Kivy).
 
-Версия 1: чтение из десктопной базы через mobile_server.py:
-  • Аналитика периода (план/факт/выполнение, машины, отставания);
-  • Загрузка машин (по РЦ, % загрузки).
+Полный функционал v2:
+  • вход по пользователям (логин/пароль, права как в программе);
+  • чтение: Аналитика, План, Доска, Факт, Справочники;
+  • запись: ввод факта с телефона (если есть право edit_fact).
 
-Сетевые запросы идут в фоновом потоке; UI обновляется в главном через Clock.
-Адрес сервера и ключ сохраняются в settings.json (user_data_dir).
+Сеть — в фоновом потоке, UI обновляется через Clock. Адрес/ключ/логин
+сохраняются в settings.json (user_data_dir).
 """
 import os
 import json
 import threading
+import datetime
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -22,25 +24,64 @@ from kivy.uix.button import Button
 from kivy.uix.textinput import TextInput
 from kivy.uix.spinner import Spinner
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.progressbar import ProgressBar
+from kivy.uix.popup import Popup
 
 from api import Api, ApiError
 
 BG = (0.07, 0.08, 0.10, 1)
 CARD = (0.13, 0.15, 0.18, 1)
 ACCENT = (0.20, 0.55, 0.90, 1)
+DIMBTN = (0.20, 0.22, 0.25, 1)
 TXT = (0.92, 0.94, 0.96, 1)
 MUT = (0.62, 0.66, 0.72, 1)
+GREEN = (0.20, 0.65, 0.35, 1)
+RED = (0.80, 0.30, 0.30, 1)
+
+
+def with_bg(widget, color):
+    from kivy.graphics import Color, Rectangle
+    with widget.canvas.before:
+        Color(*color)
+        rect = Rectangle(pos=widget.pos, size=widget.size)
+    widget.bind(pos=lambda *_: setattr(rect, "pos", widget.pos),
+                size=lambda *_: setattr(rect, "size", widget.size))
 
 
 def _row(label, value, big=False):
     b = BoxLayout(size_hint_y=None, height=dp(38 if not big else 56), padding=(dp(12), 0))
-    b.add_widget(Label(text=label, color=MUT, halign="left", valign="middle",
-                       font_size=dp(15), text_size=(dp(180), None)))
+    b.add_widget(Label(text=str(label), color=MUT, halign="left", valign="middle",
+                       font_size=dp(15), text_size=(dp(190), None)))
     b.add_widget(Label(text=str(value), color=TXT, halign="right", valign="middle",
                        font_size=dp(24 if big else 16), bold=big,
                        text_size=(dp(150), None)))
     return b
+
+
+def _header(text):
+    lb = Label(text=str(text), color=ACCENT, bold=True, size_hint_y=None, height=dp(34),
+               halign="left", valign="middle", font_size=dp(15))
+    lb.bind(size=lambda w, *_: setattr(w, "text_size", (w.width - dp(24), None)))
+    return lb
+
+
+def _task_card(title, sub, on_press=None):
+    card = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(58),
+                     padding=(dp(12), dp(6)), spacing=dp(2))
+    with_bg(card, CARD)
+    t = Label(text=title, color=TXT, halign="left", valign="middle", font_size=dp(15),
+              size_hint_y=None, height=dp(24))
+    t.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+    s = Label(text=sub, color=MUT, halign="left", valign="middle", font_size=dp(13),
+              size_hint_y=None, height=dp(20))
+    s.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+    card.add_widget(t)
+    card.add_widget(s)
+    if on_press:
+        btn = Button(background_color=(0, 0, 0, 0), on_release=lambda *_: on_press())
+        wrap = BoxLayout(size_hint_y=None, height=dp(58))
+        wrap.add_widget(card)
+        card.add_widget(btn)
+    return card
 
 
 class KnitApp(App):
@@ -49,83 +90,135 @@ class KnitApp(App):
         self.api = Api()
         self.period = None
         self.periods = []
+        self.view = "an"
         self._load_settings()
 
-        root = BoxLayout(orientation="vertical")
-        with_bg(root, BG)
+        self.root_box = BoxLayout(orientation="vertical")
+        with_bg(self.root_box, BG)
+        self._build_login()
+        return self.root_box
 
-        # ── панель подключения ────────────────────────────────────────────
-        conn = GridLayout(cols=1, size_hint_y=None, height=dp(150),
-                          padding=dp(8), spacing=dp(6))
-        with_bg(conn, CARD)
-        self.url_in = TextInput(text=self.api.base_url, hint_text="http://IP:8765",
-                                multiline=False, size_hint_y=None, height=dp(40),
-                                write_tab=False)
-        self.key_in = TextInput(text=self.api.key, hint_text="ключ (если задан)",
-                                multiline=False, password=True, size_hint_y=None,
-                                height=dp(40), write_tab=False)
-        line = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        self.connect_btn = Button(text="Подключить", background_color=ACCENT,
-                                  on_release=lambda *_: self.connect())
-        self.period_sp = Spinner(text="период", values=[],
-                                 on_text=lambda *_: self.on_period())
-        line.add_widget(self.connect_btn)
-        line.add_widget(self.period_sp)
-        conn.add_widget(self.url_in)
-        conn.add_widget(self.key_in)
-        conn.add_widget(line)
-        root.add_widget(conn)
-
-        # ── переключатель экранов ─────────────────────────────────────────
-        tabs = BoxLayout(size_hint_y=None, height=dp(46))
-        self.tab_an = Button(text="Аналитика", on_release=lambda *_: self.show("an"))
-        self.tab_ml = Button(text="Машины", on_release=lambda *_: self.show("ml"))
-        tabs.add_widget(self.tab_an)
-        tabs.add_widget(self.tab_ml)
-        root.add_widget(tabs)
-
-        # ── контент со скроллом ───────────────────────────────────────────
-        self.status = Label(text="Введите адрес сервера и нажмите «Подключить».",
-                            color=MUT, size_hint_y=None, height=dp(30), font_size=dp(14))
-        root.add_widget(self.status)
-
-        self.scroll = ScrollView()
-        self.content = GridLayout(cols=1, size_hint_y=None, spacing=dp(6),
-                                  padding=(0, dp(4)))
-        self.content.bind(minimum_height=self.content.setter("height"))
-        self.scroll.add_widget(self.content)
-        root.add_widget(self.scroll)
-
-        self.view = "an"
-        if self.api.base_url:
-            Clock.schedule_once(lambda *_: self.connect(), 0.3)
-        return root
-
-    # ── настройки ─────────────────────────────────────────────────────────
+    # ── настройки ───────────────────────────────────────────────────────────
     def _settings_path(self):
         return os.path.join(self.user_data_dir, "settings.json")
 
     def _load_settings(self):
+        self._cfg = {"url": "", "key": "", "user": ""}
         try:
             with open(self._settings_path(), encoding="utf-8") as f:
-                s = json.load(f)
-            self.api = Api(s.get("url", ""), s.get("key", ""))
+                self._cfg.update(json.load(f))
         except Exception:
-            self.api = Api()
+            pass
 
     def _save_settings(self):
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as f:
-                json.dump({"url": self.api.base_url, "key": self.api.key}, f)
+                json.dump(self._cfg, f)
         except Exception:
             pass
 
-    # ── действия ──────────────────────────────────────────────────────────
-    def connect(self):
-        self.api = Api(self.url_in.text.strip(), self.key_in.text.strip())
+    # ── экран входа ─────────────────────────────────────────────────────────
+    def _build_login(self):
+        self.root_box.clear_widgets()
+        box = GridLayout(cols=1, spacing=dp(10), padding=dp(20),
+                         size_hint=(1, None), pos_hint={"top": 1})
+        box.bind(minimum_height=box.setter("height"))
+        box.add_widget(Label(text="Вход", color=TXT, font_size=dp(26), bold=True,
+                             size_hint_y=None, height=dp(50)))
+        self.url_in = TextInput(text=self._cfg.get("url", ""), hint_text="http://IP:8765",
+                                multiline=False, size_hint_y=None, height=dp(46),
+                                write_tab=False)
+        self.key_in = TextInput(text=self._cfg.get("key", ""), hint_text="ключ сервера (если задан)",
+                                multiline=False, size_hint_y=None, height=dp(46), write_tab=False)
+        self.user_in = TextInput(text=self._cfg.get("user", ""), hint_text="логin",
+                                 multiline=False, size_hint_y=None, height=dp(46), write_tab=False)
+        self.pw_in = TextInput(hint_text="пароль", password=True, multiline=False,
+                               size_hint_y=None, height=dp(46), write_tab=False)
+        for w in (self.url_in, self.key_in, self.user_in, self.pw_in):
+            box.add_widget(w)
+        self.login_btn = Button(text="Войти", background_color=ACCENT, color=(1, 1, 1, 1),
+                                size_hint_y=None, height=dp(50),
+                                on_release=lambda *_: self.do_login())
+        box.add_widget(self.login_btn)
+        self.login_status = Label(text="", color=MUT, size_hint_y=None, height=dp(40),
+                                  font_size=dp(14))
+        box.add_widget(self.login_status)
+        self.root_box.add_widget(box)
+
+    def do_login(self):
+        url = self.url_in.text.strip()
+        key = self.key_in.text.strip()
+        user = self.user_in.text.strip()
+        pw = self.pw_in.text
+        if not url or not user:
+            self.login_status.text = "Укажите адрес сервера и логин."
+            return
+        self.api = Api(url, key)
+        self.login_status.text = "Вход…"
+
+        def work():
+            try:
+                r = self.api.login(user, pw)
+                err = None if r.get("ok") else r.get("error", "ошибка входа")
+            except ApiError as e:
+                r, err = None, str(e)
+            Clock.schedule_once(lambda *_: self._after_login(user, err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_login(self, user, err):
+        if err:
+            self.login_status.text = f"Ошибка: {err}"
+            return
+        self._cfg.update({"url": self.api.base_url, "key": self.api.key, "user": user})
         self._save_settings()
-        self._set_status("Подключение…")
+        self._build_main()
+
+    # ── основной экран ──────────────────────────────────────────────────────
+    def _build_main(self):
+        self.root_box.clear_widgets()
+
+        top = GridLayout(cols=1, size_hint_y=None, height=dp(96), padding=dp(8),
+                         spacing=dp(6))
+        with_bg(top, CARD)
+        line = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
+        who = self.api.full_name or self._cfg.get("user", "")
+        line.add_widget(Label(text=f"{who} · {self.api.role}", color=MUT,
+                              halign="left", valign="middle", font_size=dp(13),
+                              text_size=(dp(220), None)))
+        line.add_widget(Button(text="Выход", size_hint_x=None, width=dp(90),
+                               background_color=DIMBTN, on_release=lambda *_: self.do_logout()))
+        top.add_widget(line)
+        self.period_sp = Spinner(text="период", values=[], size_hint_y=None, height=dp(40))
+        self.period_sp.bind(text=lambda *_: self.on_period())
+        top.add_widget(self.period_sp)
+        self.root_box.add_widget(top)
+
+        tabs = GridLayout(cols=5, size_hint_y=None, height=dp(44), spacing=dp(2))
+        self.tab_btns = {}
+        for key, lbl in [("an", "Аналитика"), ("plan", "План"), ("board", "Доска"),
+                         ("fact", "Факт"), ("ref", "Справ.")]:
+            b = Button(text=lbl, font_size=dp(13),
+                       on_release=lambda _w, k=key: self.show(k))
+            self.tab_btns[key] = b
+            tabs.add_widget(b)
+        self.root_box.add_widget(tabs)
+
+        self.status = Label(text="", color=MUT, size_hint_y=None, height=dp(26),
+                            font_size=dp(13))
+        self.root_box.add_widget(self.status)
+
+        self.scroll = ScrollView()
+        self.content = GridLayout(cols=1, size_hint_y=None, spacing=dp(6), padding=(0, dp(4)))
+        self.content.bind(minimum_height=self.content.setter("height"))
+        self.scroll.add_widget(self.content)
+        self.root_box.add_widget(self.scroll)
+
+        self.show("an")
         self._bg(self.api.periods, self._on_periods)
+
+    def do_logout(self):
+        self.api.logout()
+        self._build_login()
 
     def _on_periods(self, periods, err):
         if err:
@@ -142,73 +235,173 @@ class KnitApp(App):
             self._set_status("Периоды не найдены.")
 
     def on_period(self):
-        if self.period_sp.text and self.period_sp.text != self.period:
+        if self.period_sp.text and self.period_sp.text != self.period \
+                and self.period_sp.text in self.period_sp.values:
             self.period = self.period_sp.text
             self.refresh()
 
     def show(self, view):
         self.view = view
-        self.tab_an.background_color = ACCENT if view == "an" else (0.2, 0.22, 0.25, 1)
-        self.tab_ml.background_color = ACCENT if view == "ml" else (0.2, 0.22, 0.25, 1)
+        for k, b in self.tab_btns.items():
+            b.background_color = ACCENT if k == view else DIMBTN
         self.refresh()
 
     def refresh(self):
         if not self.period:
             return
         self._set_status("Загрузка…")
-        if self.view == "an":
-            self._bg(lambda: self.api.analytics(self.period), self._render_analytics)
-        else:
-            self._bg(lambda: self.api.machine_load(self.period), self._render_machines)
+        p = self.period
+        v = self.view
+        fn = {"an": lambda: self.api.analytics(p), "plan": lambda: self.api.plan(p),
+              "board": lambda: self.api.board(p), "fact": lambda: self.api.fact(p),
+              "ref": lambda: self.api.refs(self._ref_kind())}[v]
+        render = {"an": self._render_analytics, "plan": self._render_plan,
+                  "board": self._render_board, "fact": self._render_fact,
+                  "ref": self._render_refs}[v]
+        self._bg(fn, render)
 
-    # ── рендер ──────────────────────────────────────────────────────────────
+    # ── рендеры ───────────────────────────────────────────────────────────
     def _render_analytics(self, a, err):
         self.content.clear_widgets()
         if err:
             return self._set_status(f"Ошибка: {err}")
         self._set_status(f"Период: {a['период']}")
         self.content.add_widget(_row("Выполнение", f"{a['выполнение_%']} %", big=True))
-        for lbl, key in [("План, пар", "план_пар"), ("Факт, пар", "факт_пар"),
-                         ("Остаток, пар", "остаток_пар"), ("Заданий", "заданий"),
-                         ("Не назначено", "не_назначено"),
-                         ("Машин активно", "машин_активно"),
-                         ("Машин задействовано", "машин_задействовано"),
-                         ("Средняя загрузка, пар", "средняя_загрузка_пар")]:
-            self.content.add_widget(_row(lbl, a.get(key, "—")))
-        lag = a.get("топ_отставаний") or []
-        if lag:
+        for lbl, k in [("План, пар", "план_пар"), ("Факт, пар", "факт_пар"),
+                       ("Остаток, пар", "остаток_пар"), ("Заданий", "заданий"),
+                       ("Не назначено", "не_назначено"),
+                       ("Машин активно", "машин_активно"),
+                       ("Машин задействовано", "машин_задействовано"),
+                       ("Средняя загрузка, пар", "средняя_загрузка_пар")]:
+            self.content.add_widget(_row(lbl, a.get(k, "—")))
+        for r in (a.get("топ_отставаний") or [])[:1]:
             self.content.add_widget(_header("Топ отставаний"))
-            for r in lag:
-                txt = f"{r['art']} {r.get('color','')}".strip()
-                self.content.add_widget(_row(txt, f"−{r['остаток']}"))
+            break
+        for r in (a.get("топ_отставаний") or []):
+            self.content.add_widget(_row(f"{r['art']} {r.get('color','')}".strip(),
+                                         f"−{r['остаток']}"))
 
-    def _render_machines(self, rows, err):
+    def _render_plan(self, rows, err):
         self.content.clear_widgets()
         if err:
             return self._set_status(f"Ошибка: {err}")
-        self._set_status(f"Машин: {len(rows)}")
-        cur = None
-        for r in rows:
-            if r["rc"] != cur:
-                cur = r["rc"]
-                self.content.add_widget(_header(f"РЦ {cur} игл"))
-            card = BoxLayout(orientation="vertical", size_hint_y=None,
-                             height=dp(62), padding=(dp(12), dp(6)), spacing=dp(4))
-            with_bg(card, CARD)
-            top = BoxLayout(size_hint_y=None, height=dp(24))
-            st = "" if str(r.get("status", "")).startswith("Актив") else f"  ({r.get('status','')})"
-            top.add_widget(Label(text=f"№{r['machine']}{st}", color=TXT,
-                                 halign="left", valign="middle", font_size=dp(16),
-                                 text_size=(dp(180), None)))
-            top.add_widget(Label(text=f"{r['plan_пар']} пар · {r['sku']} SKU · {r['загрузка_%']}%",
-                                 color=MUT, halign="right", valign="middle",
-                                 font_size=dp(13), text_size=(dp(180), None)))
-            card.add_widget(top)
-            pb = ProgressBar(max=100, value=r["загрузка_%"], size_hint_y=None, height=dp(10))
-            card.add_widget(pb)
-            self.content.add_widget(card)
+        self._set_status(f"Заданий: {len(rows)}")
+        for r in rows[:400]:
+            m = f"маш {r['machine']}" if r["machine"] is not None else "не назначено"
+            sub = f"РЦ {r['rc']} · {m} · план {r['qty_plan']} · факт {r['done']}"
+            self.content.add_widget(_task_card(
+                f"{r['art']} {r['color']} {r['sz']}".strip(), sub))
+        if len(rows) > 400:
+            self.content.add_widget(_row("…", f"показаны первые 400 из {len(rows)}"))
 
-    # ── фон/утилиты ─────────────────────────────────────────────────────────
+    def _render_board(self, machines, err):
+        self.content.clear_widgets()
+        if err:
+            return self._set_status(f"Ошибка: {err}")
+        self._set_status(f"Машин: {len(machines)}")
+        for m in machines:
+            self.content.add_widget(_header(f"Машина {m['machine']} · РЦ {m['rc']}"))
+            for i, t in enumerate(m["tasks"], 1):
+                sub = f"план {t['qty_plan']} · факт {t['done']} · ост {t['остаток']}"
+                self.content.add_widget(_task_card(
+                    f"{i}. {t['art']} {t['color']} {t['sz']}".strip(), sub))
+
+    def _render_fact(self, rows, err):
+        self.content.clear_widgets()
+        if err:
+            return self._set_status(f"Ошибка: {err}")
+        can_edit = self.api.can("edit_fact")
+        self._set_status(("Факт — нажмите задание для ввода" if can_edit
+                          else "Факт (только просмотр)"))
+        for r in rows[:400]:
+            sub = f"план {r['qty_plan']} · факт {r['done']} · ост {r['остаток']} · {r['процент']}%"
+            cb = (lambda rr=r: self._open_fact_entry(rr)) if can_edit else None
+            self.content.add_widget(_task_card(
+                f"{r['art']} {r['color']} {r['sz']}".strip(), sub, on_press=cb))
+
+    def _ref_kind(self):
+        return getattr(self, "_refkind", "articles")
+
+    def _render_refs(self, rows, err):
+        self.content.clear_widgets()
+        if err:
+            return self._set_status(f"Ошибка: {err}")
+        switch = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        for kind, lbl in [("articles", "Артикулы"), ("machines", "Машины")]:
+            switch.add_widget(Button(
+                text=lbl, font_size=dp(13),
+                background_color=ACCENT if self._ref_kind() == kind else DIMBTN,
+                on_release=lambda _w, k=kind: self._set_ref_kind(k)))
+        self.content.add_widget(switch)
+        self._set_status(f"Записей: {len(rows)}")
+        if self._ref_kind() == "machines":
+            for r in rows:
+                self.content.add_widget(_row(f"Машина {r['number']}",
+                                             f"РЦ {r['rc']} · {r['status']}"))
+        else:
+            for r in rows[:500]:
+                self.content.add_widget(_task_card(
+                    f"{r['art']} {r['color']} {r['sz']}".strip(),
+                    f"РЦ {r['rc']} · {r.get('type','')}"))
+
+    def _set_ref_kind(self, kind):
+        self._refkind = kind
+        self.refresh()
+
+    # ── ввод факта ──────────────────────────────────────────────────────────
+    def _open_fact_entry(self, r):
+        content = GridLayout(cols=1, spacing=dp(8), padding=dp(12))
+        content.add_widget(Label(text=f"{r['art']} {r['color']} {r['sz']}".strip(),
+                                 color=TXT, font_size=dp(16), size_hint_y=None, height=dp(30)))
+        content.add_widget(Label(text=f"План {r['qty_plan']} · уже факт {r['done']}",
+                                 color=MUT, font_size=dp(13), size_hint_y=None, height=dp(22)))
+        date_in = TextInput(text=datetime.date.today().isoformat(),
+                            hint_text="дата ГГГГ-ММ-ДД", multiline=False,
+                            size_hint_y=None, height=dp(44), write_tab=False)
+        day_in = TextInput(hint_text="день (пар)", input_filter="int",
+                          multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
+        night_in = TextInput(hint_text="ночь (пар)", input_filter="int",
+                            multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
+        content.add_widget(date_in)
+        content.add_widget(day_in)
+        content.add_widget(night_in)
+        msg = Label(text="", color=MUT, font_size=dp(13), size_hint_y=None, height=dp(24))
+        content.add_widget(msg)
+        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        save_b = Button(text="Сохранить", background_color=GREEN)
+        cancel_b = Button(text="Отмена", background_color=DIMBTN)
+        btns.add_widget(save_b)
+        btns.add_widget(cancel_b)
+        content.add_widget(btns)
+
+        popup = Popup(title="Ввод факта", content=content, size_hint=(0.9, None),
+                      height=dp(420))
+
+        def save(*_):
+            msg.text = "Сохранение…"
+
+            def work():
+                try:
+                    res = self.api.save_fact(r["id"], date_in.text.strip(),
+                                             day_in.text or 0, night_in.text or 0)
+                    err = None if res.get("ok") else res.get("error", "ошибка")
+                except ApiError as e:
+                    err = str(e)
+                Clock.schedule_once(lambda *_: done(err), 0)
+
+            def done(err):
+                if err:
+                    msg.text = f"Ошибка: {err}"
+                else:
+                    popup.dismiss()
+                    self.refresh()
+            threading.Thread(target=work, daemon=True).start()
+
+        save_b.bind(on_release=save)
+        cancel_b.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ── утилиты ───────────────────────────────────────────────────────────
     def _bg(self, fn, done):
         def work():
             try:
@@ -221,24 +414,8 @@ class KnitApp(App):
         threading.Thread(target=work, daemon=True).start()
 
     def _set_status(self, t):
-        self.status.text = t
-
-
-def _header(text):
-    lb = Label(text=text, color=ACCENT, bold=True, size_hint_y=None, height=dp(34),
-               halign="left", valign="middle", font_size=dp(15))
-    lb.bind(size=lambda w, *_: setattr(w, "text_size", (w.width - dp(24), None)))
-    lb.padding_x = dp(12)
-    return lb
-
-
-def with_bg(widget, color):
-    from kivy.graphics import Color, Rectangle
-    with widget.canvas.before:
-        Color(*color)
-        rect = Rectangle(pos=widget.pos, size=widget.size)
-    widget.bind(pos=lambda *_: setattr(rect, "pos", widget.pos),
-                size=lambda *_: setattr(rect, "size", widget.size))
+        if hasattr(self, "status"):
+            self.status.text = t
 
 
 if __name__ == "__main__":
