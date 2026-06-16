@@ -3,7 +3,7 @@
 
 Полный функционал v2:
   • вход по пользователям (логин/пароль, права как в программе);
-  • чтение: Аналитика, План, Доска, Факт, Справочники;
+  • разделы: Скан (поиск паспортов + ввод факта по QR), Аналитика, План, Доска;
   • запись: ввод факта с телефона (если есть право edit_fact).
 
 Сеть — в фоновом потоке, UI обновляется через Clock. Адрес/ключ/логин
@@ -28,19 +28,17 @@ from kivy.uix.popup import Popup
 
 from api import Api, ApiError
 
-# Сканер штрих-кодов (встроенная камера). Импорт «мягкий» + диагностика:
-# при недоступности показываем точную причину, чтобы понять, что чинить.
+# Сканер штрих-кодов: камера XCamera (низкое разрешение) + распознавание pyzbar
+# с троттлингом (раз в ~0.3 с), чтобы не нагружать UI и не дёргать камеру.
 CAMERA_ERR = ""
 try:
-    from pyzbar.pyzbar import ZBarSymbol
+    from pyzbar.pyzbar import decode as zbar_decode, ZBarSymbol
+    from kivy_garden.xcamera import XCamera
+    from PIL import Image
+    HAS_CAMERA = True
 except Exception as e:
-    CAMERA_ERR = f"pyzbar: {type(e).__name__}: {e}"
-try:
-    from kivy_garden.zbarcam import ZBarCam
-except Exception as e:
-    CAMERA_ERR = (CAMERA_ERR + " | " if CAMERA_ERR else "") + \
-        f"zbarcam: {type(e).__name__}: {e}"
-HAS_CAMERA = (CAMERA_ERR == "")
+    HAS_CAMERA = False
+    CAMERA_ERR = f"{type(e).__name__}: {e}"
 
 BG = (0.07, 0.08, 0.10, 1)
 CARD = (0.13, 0.15, 0.18, 1)
@@ -207,10 +205,10 @@ class KnitApp(App):
         top.add_widget(self.period_sp)
         self.root_box.add_widget(top)
 
-        tabs = GridLayout(cols=3, size_hint_y=None, height=dp(86), spacing=dp(2))
+        tabs = GridLayout(cols=2, size_hint_y=None, height=dp(86), spacing=dp(2))
         self.tab_btns = {}
         for key, lbl in [("scan", "Скан"), ("an", "Аналитика"), ("plan", "План"),
-                         ("board", "Доска"), ("fact", "Факт"), ("ref", "Справ.")]:
+                         ("board", "Доска")]:
             b = Button(text=lbl, font_size=dp(13),
                        on_release=lambda _w, k=key: self.show(k))
             self.tab_btns[key] = b
@@ -269,11 +267,9 @@ class KnitApp(App):
         p = self.period
         v = self.view
         fn = {"an": lambda: self.api.analytics(p), "plan": lambda: self.api.plan(p),
-              "board": lambda: self.api.board(p), "fact": lambda: self.api.fact(p),
-              "ref": lambda: self.api.refs(self._ref_kind())}[v]
+              "board": lambda: self.api.board(p)}[v]
         render = {"an": self._render_analytics, "plan": self._render_plan,
-                  "board": self._render_board, "fact": self._render_fact,
-                  "ref": self._render_refs}[v]
+                  "board": self._render_board}[v]
         self._bg(fn, render)
 
     # ── рендеры ───────────────────────────────────────────────────────────
@@ -322,109 +318,134 @@ class KnitApp(App):
                 self.content.add_widget(_task_card(
                     f"{i}. {t['art']} {t['color']} {t['sz']}".strip(), sub))
 
-    def _render_fact(self, rows, err):
-        self.content.clear_widgets()
-        if err:
-            return self._set_status(f"Ошибка: {err}")
-        can_edit = self.api.can("edit_fact")
-        self._set_status(("Факт — нажмите задание для ввода" if can_edit
-                          else "Факт (только просмотр)"))
-        for r in rows[:400]:
-            sub = f"план {r['qty_plan']} · факт {r['done']} · ост {r['остаток']} · {r['процент']}%"
-            cb = (lambda rr=r: self._open_fact_entry(rr)) if can_edit else None
-            self.content.add_widget(_task_card(
-                f"{r['art']} {r['color']} {r['sz']}".strip(), sub, on_press=cb))
-
-    def _ref_kind(self):
-        return getattr(self, "_refkind", "articles")
-
-    def _render_refs(self, rows, err):
-        self.content.clear_widgets()
-        if err:
-            return self._set_status(f"Ошибка: {err}")
-        switch = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
-        for kind, lbl in [("articles", "Артикулы"), ("machines", "Машины")]:
-            switch.add_widget(Button(
-                text=lbl, font_size=dp(13),
-                background_color=ACCENT if self._ref_kind() == kind else DIMBTN,
-                on_release=lambda _w, k=kind: self._set_ref_kind(k)))
-        self.content.add_widget(switch)
-        self._set_status(f"Записей: {len(rows)}")
-        if self._ref_kind() == "machines":
-            for r in rows:
-                self.content.add_widget(_row(f"Машина {r['number']}",
-                                             f"РЦ {r['rc']} · {r['status']}"))
-        else:
-            for r in rows[:500]:
-                self.content.add_widget(_task_card(
-                    f"{r['art']} {r['color']} {r['sz']}".strip(),
-                    f"РЦ {r['rc']} · {r.get('type','')}"))
-
-    def _set_ref_kind(self, kind):
-        self._refkind = kind
-        self.refresh()
-
-    # ── скан паспорта мешка ─────────────────────────────────────────────────
+    # ── скан / поиск паспортов мешков ───────────────────────────────────────
     def _render_scan(self):
         self.content.clear_widgets()
-        self._set_status("Скан паспорта мешка")
-        box = GridLayout(cols=1, size_hint_y=None, spacing=dp(10), padding=dp(8))
-        box.bind(minimum_height=box.setter("height"))
-        box.add_widget(Label(text="Отсканируйте штрих-код паспорта мешка камерой "
-                            "или введите код вручную.", color=MUT, font_size=dp(14),
-                            size_hint_y=None, height=dp(46),
-                            text_size=(dp(320), None), halign="left"))
+        self._set_status("Скан и поиск паспортов")
+
         cam_btn = Button(text="📷 Сканировать камерой", background_color=ACCENT,
-                         color=(1, 1, 1, 1), size_hint_y=None, height=dp(54),
+                         color=(1, 1, 1, 1), size_hint_y=None, height=dp(52),
                          on_release=lambda *_: self._start_camera())
-        box.add_widget(cam_btn)
+        self.content.add_widget(cam_btn)
         self.code_in = TextInput(hint_text="код паспорта (вручную)", multiline=False,
-                                 size_hint_y=None, height=dp(48), write_tab=False)
-        box.add_widget(self.code_in)
-        box.add_widget(Button(text="Найти по коду", background_color=DIMBTN,
-                              size_hint_y=None, height=dp(48),
-                              on_release=lambda *_: self._lookup(self.code_in.text.strip())))
-        self.scan_msg = Label(text=("" if HAS_CAMERA else
-                                    "Камера недоступна: " + CAMERA_ERR),
-                              color=MUT, font_size=dp(12), size_hint_y=None, height=dp(80),
+                                 size_hint_y=None, height=dp(46), write_tab=False)
+        self.content.add_widget(self.code_in)
+        self.content.add_widget(Button(
+            text="Найти по коду", background_color=DIMBTN, size_hint_y=None, height=dp(44),
+            on_release=lambda *_: self._lookup(self.code_in.text.strip())))
+        self.scan_msg = Label(text=("" if HAS_CAMERA else "Камера недоступна: " + CAMERA_ERR),
+                              color=MUT, font_size=dp(12), size_hint_y=None, height=dp(50),
                               text_size=(dp(320), None), halign="left")
-        box.add_widget(self.scan_msg)
-        self.content.add_widget(box)
+        self.content.add_widget(self.scan_msg)
+
+        self.content.add_widget(_header("Поиск паспортов"))
+        # поля фильтров (любое можно оставить пустым)
+        self._flt = {}
+
+        def field(key, hint, numeric=False):
+            ti = TextInput(hint_text=hint, multiline=False, size_hint_y=None, height=dp(44),
+                           write_tab=False, input_filter=("int" if numeric else None))
+            self._flt[key] = ti
+            return ti
+
+        self.content.add_widget(field("date", "день (ГГГГ-ММ-ДД)"))
+        self.shift_sp = Spinner(text="смена: любая", values=["смена: любая", "день", "ночь"],
+                                size_hint_y=None, height=dp(44))
+        self.content.add_widget(self.shift_sp)
+        rcm = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        rcm.add_widget(field("rc", "РЦ", numeric=True))
+        rcm.add_widget(field("machine", "машина", numeric=True))
+        self.content.add_widget(rcm)
+        self.content.add_widget(field("art", "артикул"))
+        cs = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cs.add_widget(field("color", "цвет"))
+        cs.add_widget(field("size", "размер"))
+        self.content.add_widget(cs)
+        self.content.add_widget(Button(
+            text="Показать список", background_color=ACCENT, color=(1, 1, 1, 1),
+            size_hint_y=None, height=dp(48), on_release=lambda *_: self._search_passports()))
+
+        # контейнер результатов
+        self.scan_results = GridLayout(cols=1, size_hint_y=None, spacing=dp(6))
+        self.scan_results.bind(minimum_height=self.scan_results.setter("height"))
+        self.content.add_widget(self.scan_results)
+
+    def _search_passports(self):
+        f = {k: ti.text.strip() for k, ti in self._flt.items()}
+        sh = self.shift_sp.text
+        if sh == "день":
+            f["shift"] = "1"
+        elif sh == "ночь":
+            f["shift"] = "2"
+        if self.period:
+            f["period"] = self.period
+        self._set_status("Поиск…")
+        self._bg(lambda: self.api.passports(f), self._render_passport_list)
+
+    def _render_passport_list(self, rows, err):
+        self.scan_results.clear_widgets()
+        if err:
+            return self._set_status(f"Ошибка: {err}")
+        self._set_status(f"Найдено паспортов: {len(rows)}")
+        for r in rows:
+            title = f"{r['code']} · {r['art']} {r['color']} {r['sz']}".strip()
+            sub = (f"маш {r['machine']} · РЦ {r['rc']} · {r['fact_date']} · {r['смена']} · "
+                   f"план {r['plan_qty']} · 1с {r['fact1']} · 2с {r['fact2']}")
+            self.scan_results.add_widget(_task_card(
+                title, sub, on_press=(lambda rr=r: self._open_passport_fact(rr))))
 
     def _start_camera(self):
         if not HAS_CAMERA:
             self.scan_msg.text = "Камера недоступна: " + CAMERA_ERR
             return
         try:
-            zbarcam = ZBarCam(code_types=[ZBarSymbol.QRCODE, ZBarSymbol.CODE39,
-                                          ZBarSymbol.CODE128])
+            xcam = XCamera(play=True, resolution=(640, 480), allow_stretch=True)
         except Exception as e:
             self.scan_msg.text = f"Не удалось включить камеру: {e}"
             return
 
         wrap = BoxLayout(orientation="vertical")
-        wrap.add_widget(zbarcam)
+        wrap.add_widget(xcam)
         popup = Popup(title="Наведите на QR/штрих-код", content=wrap, size_hint=(0.95, 0.85))
 
-        # защита: не реагировать на первый кадр/старый символ; сработать один раз
         self._scan_done = False
         self._scan_armed = False
-        Clock.schedule_once(lambda *_: setattr(self, "_scan_armed", True), 0.8)
+        Clock.schedule_once(lambda *_: setattr(self, "_scan_armed", True), 0.7)
+        self._scan_ev = None
+
+        def tick(_dt):
+            if self._scan_done or not self._scan_armed:
+                return
+            tex = getattr(xcam, "texture", None)
+            if tex is None:
+                return
+            try:
+                pixels = tex.pixels
+                img = Image.frombytes("RGBA", tex.size, pixels).convert("L")
+                found = zbar_decode(img, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE39,
+                                                  ZBarSymbol.CODE128])
+            except Exception:
+                return
+            if found:
+                self._scan_done = True
+                code = found[0].data.decode("utf-8", "ignore")
+                popup.dismiss()
+                self._lookup(code)
+
+        # распознаём раз в 0.3 с — превью остаётся плавным
+        self._scan_ev = Clock.schedule_interval(tick, 0.3)
 
         def teardown(*_):
             try:
-                zbarcam.stop()
+                if self._scan_ev is not None:
+                    self._scan_ev.cancel()
+                    self._scan_ev = None
             except Exception:
                 pass
-
-        def on_symbols(_inst, symbols):
-            if not symbols or not self._scan_armed or self._scan_done:
-                return
-            self._scan_done = True
-            code = symbols[0].data.decode("utf-8", "ignore")
-            popup.dismiss()          # остановка камеры — в on_dismiss
-            self._lookup(code)
-        zbarcam.bind(symbols=on_symbols)
+            try:
+                xcam.play = False
+            except Exception:
+                pass
 
         popup.bind(on_dismiss=teardown)
         wrap.add_widget(Button(text="Отмена", size_hint_y=None, height=dp(48),
@@ -499,59 +520,6 @@ class KnitApp(App):
                 else:
                     popup.dismiss()
                     self._set_status(f"Сохранено: {p['art']} {p['color']} {p['sz']}".strip())
-            threading.Thread(target=work, daemon=True).start()
-
-        save_b.bind(on_release=save)
-        cancel_b.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
-
-    # ── ввод факта ──────────────────────────────────────────────────────────
-    def _open_fact_entry(self, r):
-        content = GridLayout(cols=1, spacing=dp(8), padding=dp(12))
-        content.add_widget(Label(text=f"{r['art']} {r['color']} {r['sz']}".strip(),
-                                 color=TXT, font_size=dp(16), size_hint_y=None, height=dp(30)))
-        content.add_widget(Label(text=f"План {r['qty_plan']} · уже факт {r['done']}",
-                                 color=MUT, font_size=dp(13), size_hint_y=None, height=dp(22)))
-        date_in = TextInput(text=datetime.date.today().isoformat(),
-                            hint_text="дата ГГГГ-ММ-ДД", multiline=False,
-                            size_hint_y=None, height=dp(44), write_tab=False)
-        day_in = TextInput(hint_text="день (пар)", input_filter="int",
-                          multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
-        night_in = TextInput(hint_text="ночь (пар)", input_filter="int",
-                            multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
-        content.add_widget(date_in)
-        content.add_widget(day_in)
-        content.add_widget(night_in)
-        msg = Label(text="", color=MUT, font_size=dp(13), size_hint_y=None, height=dp(24))
-        content.add_widget(msg)
-        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        save_b = Button(text="Сохранить", background_color=GREEN)
-        cancel_b = Button(text="Отмена", background_color=DIMBTN)
-        btns.add_widget(save_b)
-        btns.add_widget(cancel_b)
-        content.add_widget(btns)
-
-        popup = Popup(title="Ввод факта", content=content, size_hint=(0.9, None),
-                      height=dp(420))
-
-        def save(*_):
-            msg.text = "Сохранение…"
-
-            def work():
-                try:
-                    res = self.api.save_fact(r["id"], date_in.text.strip(),
-                                             day_in.text or 0, night_in.text or 0)
-                    err = None if res.get("ok") else res.get("error", "ошибка")
-                except ApiError as e:
-                    err = str(e)
-                Clock.schedule_once(lambda *_: done(err), 0)
-
-            def done(err):
-                if err:
-                    msg.text = f"Ошибка: {err}"
-                else:
-                    popup.dismiss()
-                    self.refresh()
             threading.Thread(target=work, daemon=True).start()
 
         save_b.bind(on_release=save)
