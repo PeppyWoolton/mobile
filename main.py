@@ -408,20 +408,48 @@ class KnitApp(App):
         wrap.add_widget(xcam)
         popup = Popup(title="Наведите на QR/штрих-код", content=wrap, size_hint=(0.95, 0.85))
 
+        # спрятать встроенную кнопку «фото» XCamera, чтобы не перекрывала кадр
+        def _hide_shoot(*_):
+            try:
+                from kivy.uix.button import Button as _Btn
+                for w in xcam.walk(restrict=True):
+                    if isinstance(w, _Btn):
+                        w.opacity = 0
+                        w.disabled = True
+            except Exception:
+                pass
+        Clock.schedule_once(_hide_shoot, 0.3)
+
         self._scan_done = False
         self._scan_armed = False
         Clock.schedule_once(lambda *_: setattr(self, "_scan_armed", True), 0.7)
         self._scan_ev = None
 
+        def _grab_image():
+            tex = getattr(xcam, "texture", None)
+            if tex is None and hasattr(xcam, "_camera"):
+                tex = getattr(xcam._camera, "texture", None)
+            if tex is None or not tex.size[0] or not tex.size[1]:
+                return None
+            pixels = tex.pixels
+            w, h = tex.size
+            if not pixels:
+                return None
+            nch = len(pixels) // (w * h) if (w * h) else 0
+            mode = "RGBA" if nch == 4 else ("RGB" if nch == 3 else None)
+            if mode is None:
+                return None
+            img = Image.frombytes(mode, (w, h), bytes(pixels))
+            img = img.transpose(Image.FLIP_TOP_BOTTOM).convert("L")
+            return img
+
         def tick(_dt):
             if self._scan_done or not self._scan_armed:
                 return
-            tex = getattr(xcam, "texture", None)
-            if tex is None:
-                return
             try:
-                pixels = tex.pixels
-                img = Image.frombytes("RGBA", tex.size, pixels).convert("L")
+                img = _grab_image()
+                if img is None:
+                    return
                 found = zbar_decode(img, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE39,
                                                   ZBarSymbol.CODE128])
             except Exception:
