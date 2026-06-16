@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -29,10 +29,11 @@ jobs:
             pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
             cmake libffi-dev libssl-dev build-essential ccache
 
-      - name: Install buildozer
+      - name: Install buildozer (pinned)
         run: |
           python -m pip install --upgrade pip
-          pip install "cython<3.0" buildozer
+          pip install "cython==0.29.36" "buildozer==1.5.0" \
+                      "python-for-android==2024.1.21"
 
       - name: Build APK
         run: |
