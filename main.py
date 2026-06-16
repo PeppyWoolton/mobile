@@ -28,6 +28,15 @@ from kivy.uix.popup import Popup
 
 from api import Api, ApiError
 
+# Сканер штрих-кодов (встроенная камера). Импорт «мягкий»: если модуль на сборке
+# недоступен — приложение работает, остаётся ручной ввод кода.
+try:
+    from kivy_garden.zbarcam import ZBarCam
+    from pyzbar.pyzbar import ZBarSymbol
+    HAS_CAMERA = True
+except Exception:
+    HAS_CAMERA = False
+
 BG = (0.07, 0.08, 0.10, 1)
 CARD = (0.13, 0.15, 0.18, 1)
 ACCENT = (0.20, 0.55, 0.90, 1)
@@ -193,10 +202,10 @@ class KnitApp(App):
         top.add_widget(self.period_sp)
         self.root_box.add_widget(top)
 
-        tabs = GridLayout(cols=5, size_hint_y=None, height=dp(44), spacing=dp(2))
+        tabs = GridLayout(cols=3, size_hint_y=None, height=dp(86), spacing=dp(2))
         self.tab_btns = {}
-        for key, lbl in [("an", "Аналитика"), ("plan", "План"), ("board", "Доска"),
-                         ("fact", "Факт"), ("ref", "Справ.")]:
+        for key, lbl in [("scan", "Скан"), ("an", "Аналитика"), ("plan", "План"),
+                         ("board", "Доска"), ("fact", "Факт"), ("ref", "Справ.")]:
             b = Button(text=lbl, font_size=dp(13),
                        on_release=lambda _w, k=key: self.show(k))
             self.tab_btns[key] = b
@@ -247,6 +256,8 @@ class KnitApp(App):
         self.refresh()
 
     def refresh(self):
+        if self.view == "scan":
+            return self._render_scan()
         if not self.period:
             return
         self._set_status("Загрузка…")
@@ -347,6 +358,135 @@ class KnitApp(App):
     def _set_ref_kind(self, kind):
         self._refkind = kind
         self.refresh()
+
+    # ── скан паспорта мешка ─────────────────────────────────────────────────
+    def _render_scan(self):
+        self.content.clear_widgets()
+        self._set_status("Скан паспорта мешка")
+        box = GridLayout(cols=1, size_hint_y=None, spacing=dp(10), padding=dp(8))
+        box.bind(minimum_height=box.setter("height"))
+        box.add_widget(Label(text="Отсканируйте штрих-код паспорта мешка камерой "
+                            "или введите код вручную.", color=MUT, font_size=dp(14),
+                            size_hint_y=None, height=dp(46),
+                            text_size=(dp(320), None), halign="left"))
+        cam_btn = Button(text="📷 Сканировать камерой", background_color=ACCENT,
+                         color=(1, 1, 1, 1), size_hint_y=None, height=dp(54),
+                         on_release=lambda *_: self._start_camera())
+        box.add_widget(cam_btn)
+        self.code_in = TextInput(hint_text="код паспорта (вручную)", multiline=False,
+                                 size_hint_y=None, height=dp(48), write_tab=False)
+        box.add_widget(self.code_in)
+        box.add_widget(Button(text="Найти по коду", background_color=DIMBTN,
+                              size_hint_y=None, height=dp(48),
+                              on_release=lambda *_: self._lookup(self.code_in.text.strip())))
+        self.scan_msg = Label(text=("" if HAS_CAMERA else
+                                    "Камера в этой сборке недоступна — вводите код вручную."),
+                              color=MUT, font_size=dp(13), size_hint_y=None, height=dp(40),
+                              text_size=(dp(320), None), halign="left")
+        box.add_widget(self.scan_msg)
+        self.content.add_widget(box)
+
+    def _start_camera(self):
+        if not HAS_CAMERA:
+            self.scan_msg.text = "Камера недоступна в этой сборке — вводите код вручную."
+            return
+        try:
+            zbarcam = ZBarCam(code_types=[ZBarSymbol.CODE39, ZBarSymbol.CODE128,
+                                          ZBarSymbol.QRCODE, ZBarSymbol.EAN13])
+        except Exception as e:
+            self.scan_msg.text = f"Не удалось включить камеру: {e}"
+            return
+        wrap = BoxLayout(orientation="vertical")
+        wrap.add_widget(zbarcam)
+        popup = Popup(title="Наведите на штрих-код", content=wrap, size_hint=(0.95, 0.85))
+
+        def on_symbols(_inst, symbols):
+            if symbols:
+                code = symbols[0].data.decode("utf-8", "ignore")
+                try:
+                    zbarcam.stop()
+                except Exception:
+                    pass
+                popup.dismiss()
+                self._lookup(code)
+        zbarcam.bind(symbols=on_symbols)
+        wrap.add_widget(Button(text="Отмена", size_hint_y=None, height=dp(48),
+                               background_color=DIMBTN,
+                               on_release=lambda *_: popup.dismiss()))
+        popup.open()
+
+    def _lookup(self, code):
+        code = (code or "").strip()
+        if not code:
+            return
+        self._set_status(f"Поиск паспорта {code}…")
+        self._bg(lambda: self.api.passport(code, self.period), self._on_passport)
+
+    def _on_passport(self, p, err):
+        if err:
+            return self._set_status(f"Ошибка: {err}")
+        if not p.get("ok"):
+            return self._set_status(p.get("error", "паспорт не найден"))
+        self._open_passport_fact(p)
+
+    def _open_passport_fact(self, p):
+        can_edit = self.api.can("edit_fact")
+        c = GridLayout(cols=1, spacing=dp(6), padding=dp(12))
+        c.add_widget(Label(text=f"{p['art']} {p['color']} {p['sz']}".strip(), color=TXT,
+                           font_size=dp(17), bold=True, size_hint_y=None, height=dp(28)))
+        info = (f"Маш {p['machine']} · РЦ {p['rc']} · {p['fact_date']} · {p['смена']} · "
+                f"план {p['plan_qty']}")
+        c.add_widget(Label(text=info, color=MUT, font_size=dp(13),
+                           size_hint_y=None, height=dp(22)))
+        c.add_widget(Label(text=f"Исполнитель: {self.api.full_name}", color=MUT,
+                           font_size=dp(13), size_hint_y=None, height=dp(22)))
+        c.add_widget(Label(text="Факт 1 сорт (в план):", color=TXT, font_size=dp(14),
+                           size_hint_y=None, height=dp(22), halign="left",
+                           text_size=(dp(300), None)))
+        g1 = TextInput(text=str(p.get("fact1") or ""), input_filter="int",
+                       multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
+        c.add_widget(g1)
+        c.add_widget(Label(text="Факт 2 сорт (побочный, в 1С):", color=TXT, font_size=dp(14),
+                           size_hint_y=None, height=dp(22), halign="left",
+                           text_size=(dp(300), None)))
+        g2 = TextInput(text=str(p.get("fact2") or ""), input_filter="int",
+                       multiline=False, size_hint_y=None, height=dp(44), write_tab=False)
+        c.add_widget(g2)
+        msg = Label(text=("" if can_edit else "Нет права на ввод факта"),
+                    color=MUT, font_size=dp(13), size_hint_y=None, height=dp(24))
+        c.add_widget(msg)
+        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        save_b = Button(text="Сохранить", background_color=GREEN,
+                        disabled=not can_edit)
+        cancel_b = Button(text="Закрыть", background_color=DIMBTN)
+        btns.add_widget(save_b)
+        btns.add_widget(cancel_b)
+        c.add_widget(btns)
+        popup = Popup(title=f"Паспорт {p['code']}", content=c, size_hint=(0.92, None),
+                      height=dp(460))
+
+        def save(*_):
+            msg.text = "Сохранение…"
+
+            def work():
+                try:
+                    res = self.api.save_passport_fact(p["code"], g1.text or 0, g2.text or 0)
+                    err = None if res.get("ok") else res.get("error", "ошибка")
+                except ApiError as e:
+                    err = str(e)
+                Clock.schedule_once(lambda *_: done(err), 0)
+
+            def done(err):
+                if err:
+                    msg.text = f"Ошибка: {err}"
+                else:
+                    popup.dismiss()
+                    self._set_status(f"Сохранено: {p['art']} {p['color']} {p['sz']}".strip())
+            threading.Thread(target=work, daemon=True).start()
+
+        save_b.bind(on_release=save)
+        cancel_b.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
     # ── ввод факта ──────────────────────────────────────────────────────────
     def _open_fact_entry(self, r):

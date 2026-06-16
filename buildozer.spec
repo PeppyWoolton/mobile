@@ -4,13 +4,13 @@ package.name = knitting
 package.domain = ru.peppywoolton
 source.dir = .
 source.include_exts = py
-version = 2.0
-requirements = python3,kivy
+version = 2.1
+requirements = python3,kivy,kivy_garden.zbarcam,pillow
 orientation = portrait
 fullscreen = 0
 
 # Доступ в сеть (HTTP к локальному серверу)
-android.permissions = INTERNET, ACCESS_NETWORK_STATE
+android.permissions = INTERNET, ACCESS_NETWORK_STATE, CAMERA
 # Разрешить http (не https) к серверу в локальной сети
 android.allow_cleartext_traffic = True
 

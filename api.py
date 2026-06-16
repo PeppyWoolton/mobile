@@ -90,6 +90,16 @@ class Api:
     def fact(self, p):       return self._get("/api/fact", {"period": p})
     def refs(self, kind):    return self._get("/api/refs", {"type": kind})
 
+    def passport(self, code, period=None):
+        params = {"code": code}
+        if period:
+            params["period"] = period
+        return self._get("/api/passport", params)
+
+    def save_passport_fact(self, code, grade1, grade2):
+        return self._post("/api/passport_fact", {
+            "code": code, "grade1": grade1, "grade2": grade2})
+
     # ── запись ──────────────────────────────────────────────────────────────
     def save_fact(self, plan_item_id, fact_date, qty_day, qty_night):
         return self._post("/api/fact", {
