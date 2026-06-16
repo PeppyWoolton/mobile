@@ -5,7 +5,7 @@ package.domain = ru.peppywoolton
 source.dir = .
 source.include_exts = py
 version = 2.1
-requirements = python3,kivy,pillow,libzbar,pyzbar,kivy_garden.zbarcam
+requirements = python3,kivy,pillow,libzbar,pyzbar,kivy_garden.xcamera,kivy_garden.zbarcam
 orientation = portrait
 fullscreen = 0
 
