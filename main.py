@@ -28,14 +28,19 @@ from kivy.uix.popup import Popup
 
 from api import Api, ApiError
 
-# Сканер штрих-кодов (встроенная камера). Импорт «мягкий»: если модуль на сборке
-# недоступен — приложение работает, остаётся ручной ввод кода.
+# Сканер штрих-кодов (встроенная камера). Импорт «мягкий» + диагностика:
+# при недоступности показываем точную причину, чтобы понять, что чинить.
+CAMERA_ERR = ""
+try:
+    from pyzbar.pyzbar import ZBarSymbol
+except Exception as e:
+    CAMERA_ERR = f"pyzbar: {type(e).__name__}: {e}"
 try:
     from kivy_garden.zbarcam import ZBarCam
-    from pyzbar.pyzbar import ZBarSymbol
-    HAS_CAMERA = True
-except Exception:
-    HAS_CAMERA = False
+except Exception as e:
+    CAMERA_ERR = (CAMERA_ERR + " | " if CAMERA_ERR else "") + \
+        f"zbarcam: {type(e).__name__}: {e}"
+HAS_CAMERA = (CAMERA_ERR == "")
 
 BG = (0.07, 0.08, 0.10, 1)
 CARD = (0.13, 0.15, 0.18, 1)
@@ -380,39 +385,70 @@ class KnitApp(App):
                               size_hint_y=None, height=dp(48),
                               on_release=lambda *_: self._lookup(self.code_in.text.strip())))
         self.scan_msg = Label(text=("" if HAS_CAMERA else
-                                    "Камера в этой сборке недоступна — вводите код вручную."),
-                              color=MUT, font_size=dp(13), size_hint_y=None, height=dp(40),
+                                    "Камера недоступна: " + CAMERA_ERR),
+                              color=MUT, font_size=dp(12), size_hint_y=None, height=dp(80),
                               text_size=(dp(320), None), halign="left")
         box.add_widget(self.scan_msg)
         self.content.add_widget(box)
 
     def _start_camera(self):
         if not HAS_CAMERA:
-            self.scan_msg.text = "Камера недоступна в этой сборке — вводите код вручную."
+            self.scan_msg.text = "Камера недоступна: " + CAMERA_ERR
             return
         try:
-            zbarcam = ZBarCam(code_types=[ZBarSymbol.CODE39, ZBarSymbol.CODE128,
-                                          ZBarSymbol.QRCODE, ZBarSymbol.EAN13])
+            # QR — основной формат паспортов; меньше типов = быстрее распознавание
+            zbarcam = ZBarCam(code_types=[ZBarSymbol.QRCODE, ZBarSymbol.CODE39,
+                                          ZBarSymbol.CODE128])
         except Exception as e:
             self.scan_msg.text = f"Не удалось включить камеру: {e}"
             return
+
+        # Понизить разрешение камеры — главное средство от зависаний.
+        def _lower_res(*_):
+            try:
+                xc = getattr(zbarcam, "xcamera", None)
+                if xc is None and hasattr(zbarcam, "ids"):
+                    xc = zbarcam.ids.get("xcamera")
+                if xc is not None:
+                    xc.resolution = (640, 480)
+                    xc.allow_stretch = True
+            except Exception:
+                pass
+        Clock.schedule_once(_lower_res, 0)
+
         wrap = BoxLayout(orientation="vertical")
         wrap.add_widget(zbarcam)
-        popup = Popup(title="Наведите на штрих-код", content=wrap, size_hint=(0.95, 0.85))
+        popup = Popup(title="Наведите на QR/штрих-код", content=wrap, size_hint=(0.95, 0.85))
+
+        # защита: не реагировать на самый первый кадр/старый символ и сработать 1 раз
+        self._scan_done = False
+        self._scan_armed = False
+        Clock.schedule_once(lambda *_: setattr(self, "_scan_armed", True), 0.8)
 
         def on_symbols(_inst, symbols):
-            if symbols:
-                code = symbols[0].data.decode("utf-8", "ignore")
-                try:
-                    zbarcam.stop()
-                except Exception:
-                    pass
-                popup.dismiss()
-                self._lookup(code)
+            if not symbols or not self._scan_armed or self._scan_done:
+                return
+            self._scan_done = True
+            code = symbols[0].data.decode("utf-8", "ignore")
+            try:
+                zbarcam.stop()
+                zbarcam.xcamera.play = False
+            except Exception:
+                pass
+            popup.dismiss()
+            self._lookup(code)
         zbarcam.bind(symbols=on_symbols)
+
+        def _close(*_):
+            try:
+                zbarcam.stop()
+                zbarcam.xcamera.play = False
+            except Exception:
+                pass
+            popup.dismiss()
         wrap.add_widget(Button(text="Отмена", size_hint_y=None, height=dp(48),
-                               background_color=DIMBTN,
-                               on_release=lambda *_: popup.dismiss()))
+                               background_color=DIMBTN, on_release=_close))
+        popup.bind(on_dismiss=lambda *_: _close())
         popup.open()
 
     def _lookup(self, code):
