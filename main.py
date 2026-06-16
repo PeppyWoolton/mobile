@@ -396,59 +396,40 @@ class KnitApp(App):
             self.scan_msg.text = "Камера недоступна: " + CAMERA_ERR
             return
         try:
-            # QR — основной формат паспортов; меньше типов = быстрее распознавание
             zbarcam = ZBarCam(code_types=[ZBarSymbol.QRCODE, ZBarSymbol.CODE39,
                                           ZBarSymbol.CODE128])
         except Exception as e:
             self.scan_msg.text = f"Не удалось включить камеру: {e}"
             return
 
-        # Понизить разрешение камеры — главное средство от зависаний.
-        def _lower_res(*_):
-            try:
-                xc = getattr(zbarcam, "xcamera", None)
-                if xc is None and hasattr(zbarcam, "ids"):
-                    xc = zbarcam.ids.get("xcamera")
-                if xc is not None:
-                    xc.resolution = (640, 480)
-                    xc.allow_stretch = True
-            except Exception:
-                pass
-        Clock.schedule_once(_lower_res, 0)
-
         wrap = BoxLayout(orientation="vertical")
         wrap.add_widget(zbarcam)
         popup = Popup(title="Наведите на QR/штрих-код", content=wrap, size_hint=(0.95, 0.85))
 
-        # защита: не реагировать на самый первый кадр/старый символ и сработать 1 раз
+        # защита: не реагировать на первый кадр/старый символ; сработать один раз
         self._scan_done = False
         self._scan_armed = False
         Clock.schedule_once(lambda *_: setattr(self, "_scan_armed", True), 0.8)
+
+        def teardown(*_):
+            try:
+                zbarcam.stop()
+            except Exception:
+                pass
 
         def on_symbols(_inst, symbols):
             if not symbols or not self._scan_armed or self._scan_done:
                 return
             self._scan_done = True
             code = symbols[0].data.decode("utf-8", "ignore")
-            try:
-                zbarcam.stop()
-                zbarcam.xcamera.play = False
-            except Exception:
-                pass
-            popup.dismiss()
+            popup.dismiss()          # остановка камеры — в on_dismiss
             self._lookup(code)
         zbarcam.bind(symbols=on_symbols)
 
-        def _close(*_):
-            try:
-                zbarcam.stop()
-                zbarcam.xcamera.play = False
-            except Exception:
-                pass
-            popup.dismiss()
+        popup.bind(on_dismiss=teardown)
         wrap.add_widget(Button(text="Отмена", size_hint_y=None, height=dp(48),
-                               background_color=DIMBTN, on_release=_close))
-        popup.bind(on_dismiss=lambda *_: _close())
+                               background_color=DIMBTN,
+                               on_release=lambda *_: popup.dismiss()))
         popup.open()
 
     def _lookup(self, code):
